@@ -39,7 +39,10 @@ Before starting the loop, check for required files.
 ### SQLite database
 
 ```bash
-sqlite3 autoresearch.db "CREATE TABLE IF NOT EXISTS experiments (
+python3 -c "
+import sqlite3
+conn = sqlite3.connect('autoresearch.db')
+conn.execute('''CREATE TABLE IF NOT EXISTS experiments (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   timestamp TEXT NOT NULL,
   hypothesis TEXT NOT NULL,
@@ -48,7 +51,10 @@ sqlite3 autoresearch.db "CREATE TABLE IF NOT EXISTS experiments (
   delta REAL,
   kept INTEGER NOT NULL DEFAULT 0,
   error TEXT
-);"
+)''')
+conn.commit()
+conn.close()
+"
 ```
 
 ### program.md
@@ -112,7 +118,13 @@ START_TIME=$(date +%s)
 Query SQLite for any prior runs (supports resuming):
 
 ```bash
-sqlite3 autoresearch.db "SELECT COUNT(*), MIN(CASE WHEN kept=1 THEN metric_value END) FROM experiments;" 2>/dev/null
+python3 -c "
+import sqlite3
+conn = sqlite3.connect('autoresearch.db')
+row = conn.execute('SELECT COUNT(*), MIN(CASE WHEN kept=1 THEN metric_value END) FROM experiments').fetchone()
+print(row[0], row[1])
+conn.close()
+" 2>/dev/null
 ```
 
 If prior experiments exist and the user invoked with no `--reset` flag, load the previous best metric into `BEST_METRIC` and inform the user: "Resuming from N prior experiments. Best metric so far: <value>."
@@ -178,8 +190,23 @@ Scan `TRAINING_OUTPUT` for known metric patterns in this order:
 Use the last occurrence of the matched pattern (final epoch value).
 
 ```bash
-METRIC_VALUE=$(echo "$TRAINING_OUTPUT" | grep -oP 'val_bpb:\s*\K[0-9.]+' | tail -1)
-# If empty, try val_loss, then val_acc, etc.
+METRIC_VALUE=$(echo "$TRAINING_OUTPUT" | grep -oE 'val_bpb:[[:space:]]*[0-9.]+' | grep -oE '[0-9.]+$' | tail -1)
+# If empty, try val_loss:
+if [ -z "$METRIC_VALUE" ]; then
+  METRIC_VALUE=$(echo "$TRAINING_OUTPUT" | grep -oE 'val_loss:[[:space:]]*[0-9.]+' | grep -oE '[0-9.]+$' | tail -1)
+fi
+# If empty, try val_acc or val_accuracy:
+if [ -z "$METRIC_VALUE" ]; then
+  METRIC_VALUE=$(echo "$TRAINING_OUTPUT" | grep -oE 'val_acc(uracy)?:[[:space:]]*[0-9.]+' | grep -oE '[0-9.]+$' | tail -1)
+fi
+# If empty, try accuracy:
+if [ -z "$METRIC_VALUE" ]; then
+  METRIC_VALUE=$(echo "$TRAINING_OUTPUT" | grep -oE 'accuracy:[[:space:]]*[0-9.]+' | grep -oE '[0-9.]+$' | tail -1)
+fi
+# If empty, try loss (last occurrence):
+if [ -z "$METRIC_VALUE" ]; then
+  METRIC_VALUE=$(echo "$TRAINING_OUTPUT" | grep -oE 'loss:[[:space:]]*[0-9.]+' | grep -oE '[0-9.]+$' | tail -1)
+fi
 ```
 
 If no pattern matches, use LLM judgment: read the last 20 lines of `TRAINING_OUTPUT` and identify the primary validation metric value. State which metric you found.
@@ -241,9 +268,14 @@ DIFF=$(git show $EXPERIMENT_COMMIT --stat --unified=3)
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 HYPOTHESIS_TEXT="<hypothesis text from program.md>"
 
-sqlite3 autoresearch.db "INSERT INTO experiments
-  (timestamp, hypothesis, diff, metric_value, delta, kept)
-  VALUES ('$TIMESTAMP', '$HYPOTHESIS_TEXT', '$DIFF', $METRIC_VALUE, $DELTA, $KEPT);"
+python3 -c "
+import sqlite3
+conn = sqlite3.connect('autoresearch.db')
+conn.execute('INSERT INTO experiments (timestamp, hypothesis, diff, metric_value, delta, kept) VALUES (?,?,?,?,?,?)',
+  ('$TIMESTAMP', '$HYPOTHESIS_TEXT', '$DIFF', $METRIC_VALUE, $DELTA, $KEPT))
+conn.commit()
+conn.close()
+"
 ```
 
 ## results.md Regeneration
@@ -253,11 +285,15 @@ sqlite3 autoresearch.db "INSERT INTO experiments
 After every iteration, regenerate `results.md` from SQLite:
 
 ```bash
-TOTAL=$(sqlite3 autoresearch.db "SELECT COUNT(*) FROM experiments;")
-KEPT_COUNT=$(sqlite3 autoresearch.db "SELECT COUNT(*) FROM experiments WHERE kept=1;")
-FAILED_COUNT=$(sqlite3 autoresearch.db "SELECT COUNT(*) FROM experiments WHERE error IS NOT NULL;")
-ROWS=$(sqlite3 autoresearch.db -separator '|' \
-  "SELECT id, hypothesis, metric_value, delta, kept FROM experiments ORDER BY id DESC;")
+TOTAL=$(python3 -c "import sqlite3; conn=sqlite3.connect('autoresearch.db'); print(conn.execute('SELECT COUNT(*) FROM experiments').fetchone()[0])")
+KEPT_COUNT=$(python3 -c "import sqlite3; conn=sqlite3.connect('autoresearch.db'); print(conn.execute('SELECT COUNT(*) FROM experiments WHERE kept=1').fetchone()[0])")
+FAILED_COUNT=$(python3 -c "import sqlite3; conn=sqlite3.connect('autoresearch.db'); print(conn.execute('SELECT COUNT(*) FROM experiments WHERE error IS NOT NULL').fetchone()[0])")
+ROWS=$(python3 -c "
+import sqlite3
+conn = sqlite3.connect('autoresearch.db')
+for row in conn.execute('SELECT id, hypothesis, metric_value, delta, kept FROM experiments ORDER BY id DESC'):
+    print('|'.join(str(x) for x in row))
+")
 ```
 
 Write `results.md` with this structure:
@@ -288,9 +324,14 @@ If training exits non-zero, or metric extraction fails:
 ERROR_TEXT=$(echo "$TRAINING_OUTPUT" | tail -20)
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-sqlite3 autoresearch.db "INSERT INTO experiments
-  (timestamp, hypothesis, diff, metric_value, delta, kept, error)
-  VALUES ('$TIMESTAMP', '$HYPOTHESIS_TEXT', '$DIFF', NULL, NULL, 0, '$ERROR_TEXT');"
+python3 -c "
+import sqlite3
+conn = sqlite3.connect('autoresearch.db')
+conn.execute('INSERT INTO experiments (timestamp, hypothesis, diff, metric_value, delta, kept, error) VALUES (?,?,?,?,?,?,?)',
+  ('$TIMESTAMP', '$HYPOTHESIS_TEXT', '$DIFF', None, None, 0, '$ERROR_TEXT'))
+conn.commit()
+conn.close()
+"
 ```
 
 Revert `train.py`:
